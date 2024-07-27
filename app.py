@@ -1,155 +1,85 @@
-from flask import Flask, request, render_template, send_file
+from flask import Flask, request, render_template, jsonify
 import cv2
 import numpy as np
 from PIL import Image
-import os
-import tempfile
-import shutil
+import io
 
 app = Flask(__name__)
-TEMP_DIR = 'static/temp/'
 
-# Ensure the temporary directory exists
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+# Function to process the image and remove the background using GrabCut
+def remove_background(image):
+    # Convert image to numpy array
+    image_np = np.array(image)
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    error = None
-    cleaned_filepath = None
-    area = 0
-    stitches = 0
-    cost = 0
+    # Create a mask
+    mask = np.zeros(image_np.shape[:2], np.uint8)
 
-    if request.method == 'POST':
-        # Clean up the temp directory
-        shutil.rmtree(TEMP_DIR)
-        os.makedirs(TEMP_DIR)
-        
-        file = request.files['file']
-        desired_length = request.form.get('length')
-        desired_width = request.form.get('width')
+    # Create temporary arrays used by GrabCut
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
 
-        desired_length = float(desired_length) if desired_length else 0
-        desired_width = float(desired_width) if desired_width else 0
+    # Define the rectangle which contains the foreground object
+    rect = (10, 10, image_np.shape[1]-10, image_np.shape[0]-10)
 
-        if file:
-            filepath = os.path.join(TEMP_DIR, file.filename)
-            file.save(filepath)
-            print(f"File uploaded to {filepath}")
+    # Apply GrabCut algorithm
+    cv2.grabCut(image_np, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
 
-            # Check the file format
-            file_format = file.content_type
-            print(f"Uploaded file format: {file_format}")
-            supported_formats = ["image/jpeg", "image/png"]
-            if file_format not in supported_formats:
-                print("Unsupported file format")
-                error = "Unsupported file format"
-            else:
-                area, stitches, cost = calculate_estimates(filepath, desired_length, desired_width)
-                cleaned_filepath = filepath
+    # Modify the mask so that sure and likely foreground are set to 1, and the rest are set to 0
+    mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
 
-    return render_template('index.html', filepath=cleaned_filepath, area=area, stitches=stitches, cost=cost, error=error)
+    # Apply the mask to the image
+    result_image = image_np * mask2[:, :, np.newaxis]
 
-def calculate_estimates(image_path, desired_length, desired_width):
-    # Read the image
-    image = cv2.imread(image_path)
-    if image is None:
-        print("Failed to read the image")
-        return 0, 0, 0
+    # Convert masked areas to white background
+    background = np.full_like(result_image, (255, 255, 255))
+    result_with_white_bg = np.where(result_image == 0, background, result_image)
 
-    print(f"Image read successfully: {image.shape}")
+    return result_with_white_bg, mask2
 
-    # Extract DPI
-    pil_image = Image.open(image_path)
-    dpi = pil_image.info.get('dpi', (300, 300))
-    dpi_x, dpi_y = dpi
-
-    # Use default DPI if the extracted DPI is unusually low
-    if dpi_x < 100 or dpi_y < 100:
-        dpi_x, dpi_y = 300, 300
-    print(f"DPI: {dpi_x}, {dpi_y}")
-
-    # Convert to grayscale
-    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray_image_path = os.path.join(TEMP_DIR, 'gray_image.png')
-    cv2.imwrite(gray_image_path, gray_image)
-    print(f"Grayscale image saved to {gray_image_path}")
-
-    # Apply Otsu's threshold to convert the image to binary
-    _, binary_image = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    binary_image_path = os.path.join(TEMP_DIR, 'binary_image.png')
-    cv2.imwrite(binary_image_path, binary_image)
-    print(f"Binary image saved to {binary_image_path}")
-
-    # Find contours
-    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(contours) == 0:
-        print("No contours found")
-        return 0, 0, 0
-
-    object_contour = max(contours, key=cv2.contourArea)
-    area_pixels = cv2.contourArea(object_contour)
-    print(f"Contour area in pixels: {area_pixels}")
-
-    # Draw contours on the image for visualization
-    contour_image = cv2.drawContours(image.copy(), [object_contour], -1, (0, 255, 0), 3)
-    contour_image_path = os.path.join(TEMP_DIR, 'contour_image.png')
-    cv2.imwrite(contour_image_path, contour_image)
-    print(f"Contour image saved to {contour_image_path}")
-
-    if area_pixels == 0:
-        return 0, 0, 0
-
-    # Calculate the object's current width and length in inches
-    contour_rect = cv2.minAreaRect(object_contour)
-    box = cv2.boxPoints(contour_rect)
-    box = np.int_(box)
-
-    width_pixels = np.linalg.norm(box[0] - box[1])
-    length_pixels = np.linalg.norm(box[1] - box[2])
-
-    current_width_in_inches = width_pixels / dpi_x
-    current_length_in_inches = length_pixels / dpi_y
-
-    print(f"Current width in inches: {current_width_in_inches}, Current length in inches: {current_length_in_inches}")
-
-    # Adjust dimensions based on the desired length or width
-    scale_factor_length = scale_factor_width = 1
-    if desired_length > 0 and desired_width > 0:
-        scale_factor_length = desired_length / current_length_in_inches
-        scale_factor_width = desired_width / current_width_in_inches
-        scale_factor = (scale_factor_length + scale_factor_width) / 2
-        adjusted_width_in_inches = current_width_in_inches * scale_factor
-        adjusted_length_in_inches = current_length_in_inches * scale_factor
-    elif desired_length > 0:
-        scale_factor_length = desired_length / current_length_in_inches
-        adjusted_length_in_inches = desired_length
-        adjusted_width_in_inches = current_width_in_inches * scale_factor_length
-    elif desired_width > 0:
-        scale_factor_width = desired_width / current_width_in_inches
-        adjusted_width_in_inches = desired_width
-        adjusted_length_in_inches = current_length_in_inches * scale_factor_width
+# Function to resize the image based on the user's specifications
+def resize_image(image, mask, width_inch, height_inch, dpi):
+    original_width, original_height = image.shape[1], image.shape[0]
+    if width_inch and not height_inch:
+        width_px = int(width_inch * dpi)
+        height_px = int((width_px / original_width) * original_height)
+    elif height_inch and not width_inch:
+        height_px = int(height_inch * dpi)
+        width_px = int((height_px / original_height) * original_width)
     else:
-        adjusted_length_in_inches = current_length_in_inches
-        adjusted_width_in_inches = current_width_in_inches
+        width_px = int(width_inch * dpi)
+        height_px = int(height_inch * dpi)
 
-    print(f"Adjusted width in inches: {adjusted_width_in_inches}, Adjusted length in inches: {adjusted_length_in_inches}")
+    resized_image = cv2.resize(image, (width_px, height_px), interpolation=cv2.INTER_AREA)
+    resized_mask = cv2.resize(mask, (width_px, height_px), interpolation=cv2.INTER_AREA)
+    return resized_image, resized_mask
 
-    adjusted_area_square_inches = round(adjusted_width_in_inches * adjusted_length_in_inches, 1)
+# Function to calculate the area of the object in square inches and total stitches
+def calculate_area_and_stitches(mask, dpi):
+    object_area_pixels = np.sum(mask == 1)
+    square_inches = object_area_pixels / (dpi * dpi)
+    total_stitches = square_inches * 2000
+    return square_inches, total_stitches
 
-    total_stitches = adjusted_area_square_inches * 2000
-    total_cost = (total_stitches / 1000) * 1.25
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-    print(f"Adjusted area in square inches: {adjusted_area_square_inches}")
-    print(f"Total stitches: {total_stitches}")
-    print(f"Total cost: {total_cost}")
+@app.route('/process', methods=['POST'])
+def process_image():
+    file = request.files['image']
+    width_inch = request.form.get('width', type=float)
+    height_inch = request.form.get('height', type=float)
+    
+    image = Image.open(file.stream).convert('RGB')
+    dpi = image.info.get('dpi', (300, 300))[0]  # Default to 300 DPI if not found
+    result_image, mask = remove_background(image)
+    resized_image, resized_mask = resize_image(result_image, mask, width_inch, height_inch, dpi)
+    square_inches, total_stitches = calculate_area_and_stitches(resized_mask, dpi)
 
-    return adjusted_area_square_inches, total_stitches, total_cost
+    return jsonify({
+        'square_inches': round(square_inches, 2),
+        'total_stitches': round(total_stitches)
+    })
 
-@app.route('/file/<path:filename>')
-def serve_file(filename):
-    return send_file(os.path.join(TEMP_DIR, filename))
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
